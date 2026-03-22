@@ -1,0 +1,19 @@
+[package]
+name = "pmi8998_charge_controller"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+chrono = { version = "0.4.44", default-features = false }
+log = "0.4.29"
+log4rs = { version = "1.4.0", default-features = false, features = ["file_appender", "pattern_encoder"] }
+mimalloc = { version = "0.1.48", features = ["v3", "override"] }
+nix = { version = "0.31.2", default-features = false, features = ["user"] }
+
+[profile.release]
+strip = true
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
