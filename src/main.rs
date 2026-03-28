@@ -92,7 +92,7 @@ const EMERGENCY_START_V: f64 = 3.5;
 const EMERGENCY_START_P: u8 = 25;
 
 const NORMAL_START_V: f64 = 3.75;
-const NORMAL_STOP_V: f64 = 4.1;
+const NORMAL_STOP_V: f64 = 4.2;
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const TOGGLE_INTERVAL: Duration = Duration::from_secs(300);
 
