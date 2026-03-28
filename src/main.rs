@@ -140,6 +140,7 @@ impl Controller {
                 ChargingStatus::NotCharging,
             ]
             .contains(&self.battery_status)
+            && self.battery_percentage > EMERGENCY_START_P
     }
 
     fn set_charging_bit(&mut self, bit: bool) -> Result<SleepTime, anyhow::Error> {
