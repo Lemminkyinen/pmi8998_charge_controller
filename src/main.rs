@@ -20,6 +20,7 @@ const BATTERY_CAPACITY: &str = "/sys/class/power_supply/bq27411-0/capacity";
 const BATTERY_STATUS: &str = "/sys/class/power_supply/bq27411-0/status";
 const _CHARGER_VOLTAGE: &str = "/sys/class/power_supply/pmi8998-charger/voltage_now";
 const CHARGER_STATUS: &str = "/sys/class/power_supply/pmi8998-charger/status";
+const CHARGER_CURRENT: &str = "/sys/class/power_supply/pmi8998-charger/current_now";
 
 fn init_logger() -> anyhow::Result<()> {
     let logfile = FileAppender::builder()
@@ -40,7 +41,7 @@ fn init_logger() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn read_voltage(path: &str) -> Result<f64, anyhow::Error> {
+fn read_milli_value(path: &str) -> Result<f64, anyhow::Error> {
     let voltage = fs::read_to_string(path)?;
     Ok(voltage.trim().parse::<f64>()? * 0.000_001f64)
 }
@@ -107,6 +108,7 @@ struct Controller {
     battery_percentage: u8,
     battery_status: ChargingStatus,
     charger_status: ChargingStatus,
+    charger_current: f64,
 }
 
 impl Controller {
@@ -116,10 +118,11 @@ impl Controller {
     }
 
     fn read_battery_status(&mut self) -> Result<(), anyhow::Error> {
-        self.battery_voltage = read_voltage(BATTERY_VOLTAGE)?;
+        self.battery_voltage = read_milli_value(BATTERY_VOLTAGE)?;
         self.battery_percentage = read_percentage()?;
         self.battery_status = read_status(BATTERY_STATUS)?;
         self.charger_status = read_status(CHARGER_STATUS)?;
+        self.charger_current = read_milli_value(CHARGER_CURRENT)?;
         Ok(())
     }
 
@@ -147,8 +150,9 @@ impl Controller {
         let to_state = if bit { "ON" } else { "OFF" };
         let now = Utc::now();
         log::info!(
-            "charger {to_state} at {:.3}V, {}%, battery_status={:?}, charger_status={:?}",
+            "charger {to_state} at {:.3}V, {}A, {}%, battery_status={:?}, charger_status={:?}",
             self.battery_voltage,
+            self.charger_current,
             self.battery_percentage,
             self.battery_status,
             self.charger_status,
