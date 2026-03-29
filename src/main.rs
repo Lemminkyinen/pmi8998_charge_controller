@@ -93,6 +93,7 @@ const EMERGENCY_START_P: u8 = 25;
 
 const NORMAL_START_V: f64 = 3.75;
 const NORMAL_STOP_V: f64 = 4.2;
+const NORMAL_STOP_A: f64 = 0.9;
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const TOGGLE_INTERVAL: Duration = Duration::from_secs(300);
 
@@ -144,6 +145,7 @@ impl Controller {
             ]
             .contains(&self.battery_status)
             && self.battery_percentage > EMERGENCY_START_P
+            && self.charger_current < NORMAL_STOP_A
     }
 
     fn set_charging_bit(&mut self, bit: bool) -> Result<SleepTime, anyhow::Error> {
