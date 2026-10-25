@@ -21,6 +21,7 @@ const BATTERY_STATUS: &str = "/sys/class/power_supply/bq27411-0/status";
 const _CHARGER_VOLTAGE: &str = "/sys/class/power_supply/pmi8998-charger/voltage_now";
 const CHARGER_STATUS: &str = "/sys/class/power_supply/pmi8998-charger/status";
 const CHARGER_CURRENT: &str = "/sys/class/power_supply/pmi8998-charger/current_now";
+const CPU_STAT: &str = "/proc/stat";
 
 fn init_logger() -> anyhow::Result<()> {
     let logfile = FileAppender::builder()
@@ -54,6 +55,28 @@ fn read_percentage() -> Result<u8, anyhow::Error> {
 fn read_status(path: &str) -> Result<ChargingStatus, anyhow::Error> {
     let status = fs::read_to_string(path)?;
     Ok(ChargingStatus::from_str(&status))
+}
+
+/// Reads aggregate CPU times from /proc/stat and returns (idle, total) jiffies.
+fn read_cpu_times() -> Result<(u64, u64), anyhow::Error> {
+    let stat = fs::read_to_string(CPU_STAT)?;
+    let line = stat
+        .lines()
+        .next()
+        .ok_or_else(|| anyhow!("{CPU_STAT} is empty"))?;
+
+    let mut fields = line.split_whitespace();
+    if fields.next() != Some("cpu") {
+        return Err(anyhow!("Unexpected first line in {CPU_STAT}: {line}"));
+    }
+
+    let values: Vec<u64> = fields.map(|f| f.parse::<u64>()).collect::<Result<_, _>>()?;
+
+    // user nice system idle iowait irq softirq steal
+    let field = |i: usize| values.get(i).copied().unwrap_or(0);
+    let idle = field(3) + field(4);
+    let non_idle = field(0) + field(1) + field(2) + field(5) + field(6) + field(7);
+    Ok((idle, idle + non_idle))
 }
 
 fn set_charging_bit(b: bool) -> Result<(), anyhow::Error> {
@@ -94,28 +117,36 @@ const EMERGENCY_START_P: u8 = 25;
 const NORMAL_START_V: f64 = 3.75;
 const NORMAL_STOP_V: f64 = 4.2;
 const NORMAL_STOP_A: f64 = 0.9;
+const CPU_LOAD_LIMIT: f64 = 80.0;
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const TOGGLE_INTERVAL: Duration = Duration::from_secs(300);
 
 const REQUIRED_LOW_SAMPLES: u8 = 10;
 const REQUIRED_HIGH_SAMPLES: u8 = 5;
+const REQUIRED_CPU_SAMPLES: u8 = 12;
 
 #[derive(Default)]
 struct Controller {
     low_samples: u8,
     high_samples: u8,
+    cpu_samples: u8,
 
     battery_voltage: f64,
     battery_percentage: u8,
     battery_status: ChargingStatus,
     charger_status: ChargingStatus,
     charger_current: f64,
+
+    cpu_usage: Option<f64>,
+    prev_idle: Option<u64>,
+    prev_total: Option<u64>,
 }
 
 impl Controller {
     fn reset_samples(&mut self) {
         self.low_samples = 0;
         self.high_samples = 0;
+        self.cpu_samples = 0;
     }
 
     fn read_battery_status(&mut self) -> Result<(), anyhow::Error> {
@@ -124,6 +155,27 @@ impl Controller {
         self.battery_status = read_status(BATTERY_STATUS)?;
         self.charger_status = read_status(CHARGER_STATUS)?;
         self.charger_current = read_milli_value(CHARGER_CURRENT)?;
+        Ok(())
+    }
+
+    /// Samples aggregate CPU usage in %, computed over the interval since the
+    /// previous call. The first call only stores a reference point.
+    fn read_cpu_usage(&mut self) -> Result<(), anyhow::Error> {
+        let (idle, total) = read_cpu_times()?;
+        self.cpu_usage = match (self.prev_idle, self.prev_total) {
+            (Some(prev_idle), Some(prev_total)) => {
+                let idle_delta = idle.saturating_sub(prev_idle) as f64;
+                let total_delta = total.saturating_sub(prev_total) as f64;
+                if total_delta > 0.0 {
+                    Some((1.0 - idle_delta / total_delta) * 100.0)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        self.prev_idle = Some(idle);
+        self.prev_total = Some(total);
         Ok(())
     }
 
@@ -148,14 +200,20 @@ impl Controller {
             && self.charger_current < NORMAL_STOP_A
     }
 
+    fn is_high_cpu_load(&self) -> bool {
+        self.cpu_usage.is_some_and(|usage| usage >= CPU_LOAD_LIMIT)
+            && self.charger_status != ChargingStatus::Charging
+    }
+
     fn set_charging_bit(&mut self, bit: bool) -> Result<SleepTime, anyhow::Error> {
         let to_state = if bit { "ON" } else { "OFF" };
         let now = Utc::now();
         log::info!(
-            "charger {to_state} at {:.3}V, {}A, {}%, battery_status={:?}, charger_status={:?}",
+            "charger {to_state} at {:.3}V, {}A, {}%, cpu={:.1}%, battery_status={:?}, charger_status={:?}",
             self.battery_voltage,
             self.charger_current,
             self.battery_percentage,
+            self.cpu_usage.unwrap_or(-1.0),
             self.battery_status,
             self.charger_status,
         );
@@ -175,6 +233,7 @@ impl Controller {
         if self.is_lower_limit() {
             self.low_samples += 1;
             self.high_samples = 0;
+            self.cpu_samples = 0;
 
             log::debug!(
                 "lower-limit hit: voltage={:.3}V low_samples={}/{}",
@@ -189,6 +248,7 @@ impl Controller {
         } else if self.is_higher_limit() {
             self.high_samples += 1;
             self.low_samples = 0;
+            self.cpu_samples = 0;
 
             log::debug!(
                 "higher-limit hit: voltage={:.3}V high_samples={}/{}",
@@ -199,6 +259,21 @@ impl Controller {
 
             if self.high_samples >= REQUIRED_HIGH_SAMPLES {
                 return self.set_charging_bit(false);
+            }
+        } else if self.is_high_cpu_load() {
+            self.cpu_samples += 1;
+            self.low_samples = 0;
+            self.high_samples = 0;
+
+            log::debug!(
+                "high-cpu hit: usage={:.1}% cpu_samples={}/{}",
+                self.cpu_usage.unwrap_or_default(),
+                self.cpu_samples,
+                REQUIRED_CPU_SAMPLES
+            );
+
+            if self.cpu_samples >= REQUIRED_CPU_SAMPLES {
+                return self.set_charging_bit(true);
             }
         } else {
             if self.low_samples != 0 || self.high_samples != 0 {
@@ -227,10 +302,13 @@ fn main() -> ExitCode {
     let mut controller = Controller::default();
 
     loop {
-        if let Err(e) = controller.read_battery_status() {
-            log::error!("Failed to read battery status: {e}");
+        if let Err(e) = controller
+            .read_battery_status()
+            .and_then(|_| controller.read_cpu_usage())
+        {
+            log::error!("Failed to read battery/cpu status: {e}");
             return ExitCode::FAILURE;
-        };
+        }
 
         match controller.control_step() {
             Ok(sleep_time) => thread::sleep(sleep_time.0),
