@@ -8,8 +8,11 @@ use log4rs::encode::pattern::PatternEncoder;
 use mimalloc::MiMalloc;
 use nix::unistd::Uid;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{fs, thread};
+
+mod policy;
+use policy::{Decision, Policy};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -117,26 +120,10 @@ impl ChargingStatus {
     }
 }
 
-struct SleepTime(Duration);
-
-const EMERGENCY_START_V: f64 = 3.5;
-
-const NORMAL_START_V: f64 = 3.75;
-const NORMAL_STOP_V: f64 = 4.2;
-const CPU_LOAD_LIMIT: f64 = 80.0;
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
-const TOGGLE_INTERVAL: Duration = Duration::from_secs(300);
-
-const REQUIRED_LOW_SAMPLES: u8 = 10;
-const REQUIRED_HIGH_SAMPLES: u8 = 5;
-const REQUIRED_CPU_SAMPLES: u8 = 12;
 
 #[derive(Default)]
 struct Controller {
-    low_samples: u8,
-    high_samples: u8,
-    cpu_samples: u8,
-
     battery_voltage: f64,
     // Informational only: the ageing battery's capacity estimate is unreliable.
     battery_percentage: Option<u8>,
@@ -150,12 +137,6 @@ struct Controller {
 }
 
 impl Controller {
-    fn reset_samples(&mut self) {
-        self.low_samples = 0;
-        self.high_samples = 0;
-        self.cpu_samples = 0;
-    }
-
     fn read_battery_status(&mut self) -> Result<(), anyhow::Error> {
         let voltage = read_micro_value(BATTERY_VOLTAGE)?;
         if voltage <= 0.0 || voltage > 5.0 {
@@ -190,30 +171,14 @@ impl Controller {
         Ok(())
     }
 
-    fn is_emergency(&self) -> bool {
-        (self.battery_voltage < EMERGENCY_START_V)
-            && self.charger_status != ChargingStatus::Charging
-    }
-
-    fn is_lower_limit(&self) -> bool {
-        self.battery_voltage < NORMAL_START_V && self.charger_status != ChargingStatus::Charging
-    }
-
-    fn is_higher_limit(&self) -> bool {
-        // USB input current includes the host workload, not just battery charging.
-        self.battery_voltage >= NORMAL_STOP_V
-    }
-
-    fn is_high_cpu_load(&self) -> bool {
-        self.cpu_usage.is_some_and(|usage| usage >= CPU_LOAD_LIMIT)
-            && self.charger_status != ChargingStatus::Charging
-    }
-
-    fn set_charging_bit(&mut self, bit: bool) -> Result<SleepTime, anyhow::Error> {
-        let to_state = if bit { "ON" } else { "OFF" };
+    fn apply(&self, decision: Decision) -> Result<(), anyhow::Error> {
+        let to_state = if decision.enabled { "ON" } else { "OFF" };
         let now = Utc::now();
+        set_charging_bit(decision.enabled)
+            .map_err(|e| anyhow!("Failed to set charger {to_state} {e}! {now}"))?;
         log::info!(
-            "charger {to_state} at {:.3}V, usb_input={}A, capacity={:?}%, cpu={:.1}%, battery_status={:?}, charger_status={:?}",
+            "charger {to_state}: {} at {:.3}V, usb_input={}A, capacity={:?}%, cpu={:.1}%, battery_status={:?}, charger_status={:?}",
+            decision.reason,
             self.battery_voltage,
             self.charger_current,
             self.battery_percentage,
@@ -221,72 +186,7 @@ impl Controller {
             self.battery_status,
             self.charger_status,
         );
-        self.reset_samples();
-        match set_charging_bit(bit) {
-            Ok(_) => Ok(SleepTime(TOGGLE_INTERVAL)),
-            Err(e) => Err(anyhow!("Failed to set charger {to_state} {e}! {now}")),
-        }
-    }
-
-    fn control_step(&mut self) -> Result<SleepTime, anyhow::Error> {
-        if self.is_emergency() {
-            log::warn!("Emergency start!");
-            return self.set_charging_bit(true);
-        }
-
-        if self.is_lower_limit() {
-            self.low_samples += 1;
-            self.high_samples = 0;
-            self.cpu_samples = 0;
-
-            log::debug!(
-                "lower-limit hit: voltage={:.3}V low_samples={}/{}",
-                self.battery_voltage,
-                self.low_samples,
-                REQUIRED_LOW_SAMPLES
-            );
-
-            if self.low_samples >= REQUIRED_LOW_SAMPLES {
-                return self.set_charging_bit(true);
-            }
-        } else if self.is_higher_limit() {
-            self.high_samples += 1;
-            self.low_samples = 0;
-            self.cpu_samples = 0;
-
-            log::debug!(
-                "higher-limit hit: voltage={:.3}V high_samples={}/{}",
-                self.battery_voltage,
-                self.high_samples,
-                REQUIRED_HIGH_SAMPLES
-            );
-
-            if self.high_samples >= REQUIRED_HIGH_SAMPLES {
-                return self.set_charging_bit(false);
-            }
-        } else if self.is_high_cpu_load() {
-            self.cpu_samples += 1;
-            self.low_samples = 0;
-            self.high_samples = 0;
-
-            log::debug!(
-                "high-cpu hit: usage={:.1}% cpu_samples={}/{}",
-                self.cpu_usage.unwrap_or_default(),
-                self.cpu_samples,
-                REQUIRED_CPU_SAMPLES
-            );
-
-            if self.cpu_samples >= REQUIRED_CPU_SAMPLES {
-                return self.set_charging_bit(true);
-            }
-        } else {
-            if self.low_samples != 0 || self.high_samples != 0 {
-                log::debug!("neutral zone: resetting counters");
-            }
-            self.reset_samples();
-        }
-
-        Ok(SleepTime(POLL_INTERVAL))
+        Ok(())
     }
 }
 
@@ -304,6 +204,8 @@ fn main() -> ExitCode {
 
     log::info!("Starting charge controller!");
     let mut controller = Controller::default();
+    let mut policy = Policy::default();
+    let started = Instant::now();
 
     loop {
         if let Err(e) = controller
@@ -314,13 +216,17 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
 
-        match controller.control_step() {
-            Ok(sleep_time) => thread::sleep(sleep_time.0),
-            Err(err) => {
+        let now = started.elapsed();
+        if let Some(decision) =
+            policy.evaluate(controller.battery_voltage, controller.cpu_usage, now)
+        {
+            if let Err(err) = controller.apply(decision) {
                 log::error!("{err}");
                 return ExitCode::FAILURE;
             }
+            policy.applied(decision, now);
         }
+        thread::sleep(POLL_INTERVAL);
     }
 }
 
