@@ -77,6 +77,16 @@ fn read_status(path: &str) -> Result<ChargingStatus, anyhow::Error> {
     Ok(ChargingStatus::from_str(&status))
 }
 
+/// Diagnostic telemetry only; its absence or a read failure must never
+/// influence the voltage or CPU policy decisions.
+fn format_online(online: Option<bool>) -> String {
+    match online {
+        Some(true) => "true".to_owned(),
+        Some(false) => "false".to_owned(),
+        None => telemetry::UNAVAILABLE.to_owned(),
+    }
+}
+
 fn read_online() -> anyhow::Result<bool> {
     let raw = fs::read_to_string(CHARGER_ONLINE)?;
     match raw.trim() {
@@ -159,7 +169,9 @@ struct Controller {
     charger_current: Option<f64>,
     battery_current: Option<f64>,
     battery_temperature: Option<f64>,
-    charger_online: bool,
+    // Diagnostic only. Never gates the voltage/CPU policy; a read failure
+    // (`None`) is logged and treated as unknown, not as offline.
+    charger_online: Option<bool>,
 
     cpu_usage: Option<f64>,
     prev_idle: Option<u64>,
@@ -167,13 +179,26 @@ struct Controller {
 }
 
 impl Controller {
+    fn evaluate_policy(&self, policy: &mut Policy, now: Duration) -> Option<Decision> {
+        // `online` describes the driver's power path, not permission to
+        // request charging. It must not gate or reset this state machine.
+        policy.evaluate(self.battery_voltage, self.cpu_usage, now)
+    }
+
     fn read_battery_status(&mut self) -> Result<(), anyhow::Error> {
         let voltage = read_micro_value(BATTERY_VOLTAGE)?;
         if voltage <= 0.0 || voltage > 5.0 {
             return Err(anyhow!("Invalid battery voltage: {voltage}V"));
         }
         self.battery_voltage = voltage;
-        self.charger_online = read_online()?;
+        self.charger_online = match read_online() {
+            Ok(online) => Some(online),
+            Err(e) => {
+                // A failed online read does not invalidate the voltage sample.
+                log::warn!("charger online unreadable: {e}");
+                None
+            }
+        };
         self.battery_percentage = read_percentage().ok();
         self.battery_status = read_status(BATTERY_STATUS).unwrap_or_default();
         self.charger_status = read_status(CHARGER_STATUS).unwrap_or_default();
@@ -246,7 +271,7 @@ impl Controller {
             format_amps(self.charger_current),
             format_percent(self.battery_percentage),
             format_cpu_percent(self.cpu_usage),
-            self.charger_online,
+            format_online(self.charger_online),
             self.battery_status,
             self.charger_status,
         );
@@ -290,7 +315,6 @@ fn main() -> ExitCode {
     let started = Instant::now();
     let mut failed_samples = 0u32;
     let mut next_sample_log = Duration::ZERO;
-    let mut was_online = None;
 
     loop {
         let now = started.elapsed();
@@ -323,18 +347,7 @@ fn main() -> ExitCode {
                 controller.log_sample();
                 next_sample_log = now + Duration::from_secs(60);
             }
-            if was_online != Some(controller.charger_online) {
-                log::info!("Charger online={}", controller.charger_online);
-                policy = Policy::default();
-                was_online = Some(controller.charger_online);
-            }
-            if controller.charger_online {
-                policy.evaluate(controller.battery_voltage, controller.cpu_usage, now)
-            } else {
-                // Re-evaluate from fresh state on reconnect; no repeated writes
-                // to an absent power source.
-                None
-            }
+            controller.evaluate_policy(&mut policy, now)
         };
         if let Some(decision) = decision {
             match controller.apply(decision, dry_run) {

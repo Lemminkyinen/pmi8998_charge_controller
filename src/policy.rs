@@ -51,6 +51,7 @@ impl Policy {
     }
 
     /// Evaluate fresh readings. `now` is monotonic time since process startup.
+    /// The state machine is independent of charger `online` telemetry.
     pub fn evaluate(&mut self, voltage: f64, cpu: Option<f64>, now: Duration) -> Option<Decision> {
         if let Some(cpu) = cpu {
             if sustained(&mut self.busy_since, cpu >= 80.0, now, LOAD_ENTER_DELAY) {

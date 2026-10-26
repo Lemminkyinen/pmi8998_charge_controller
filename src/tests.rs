@@ -13,6 +13,28 @@ fn apply(policy: &mut Policy, voltage: f64, cpu: Option<f64>, seconds: u64) -> O
     result
 }
 
+/// Like `apply`, but goes through the orchestration helper used by main,
+/// with an explicit charger `online` reading.
+fn poll(
+    policy: &mut Policy,
+    voltage: f64,
+    cpu: Option<f64>,
+    online: Option<bool>,
+    seconds: u64,
+) -> Option<Decision> {
+    let controller = super::Controller {
+        battery_voltage: voltage,
+        cpu_usage: cpu,
+        charger_online: online,
+        ..super::Controller::default()
+    };
+    let result = controller.evaluate_policy(policy, at(seconds));
+    if let Some(decision) = result {
+        policy.applied(decision, at(seconds));
+    }
+    result
+}
+
 #[test]
 fn idle_starts_disabled_and_does_not_repeat_writes() {
     let mut policy = Policy::default();
@@ -131,4 +153,128 @@ fn middle_cpu_band_holds_heavy_mode_without_chatter() {
     apply(&mut policy, 3.9, Some(90.0), 60);
     assert_eq!(apply(&mut policy, 3.9, Some(70.0), 360), None);
     assert_eq!(apply(&mut policy, 3.9, Some(70.0), 600), None);
+}
+
+#[test]
+fn emergency_enable_at_3_4v_with_online_false() {
+    // The phone trace: online=false the whole time, CPU pegged, battery
+    // sagging. The emergency command must still be issued.
+    let mut policy = Policy::default();
+    assert!(
+        !poll(&mut policy, 3.9, Some(99.0), Some(false), 0)
+            .unwrap()
+            .enabled
+    );
+    let emergency = poll(&mut policy, 3.4, Some(99.0), Some(false), 5).unwrap();
+    assert!(emergency.enabled);
+    assert_eq!(emergency.reason, "emergency low voltage");
+}
+
+#[test]
+fn sustained_cpu_enable_is_independent_of_online_false() {
+    let mut policy = Policy::default();
+    // Startup establishes the OFF baseline (a real write); from then on the
+    // sustained-load decision is issued exactly once.
+    assert!(
+        !poll(&mut policy, 3.9, Some(99.0), Some(false), 0)
+            .unwrap()
+            .enabled
+    );
+    assert!(
+        poll(&mut policy, 3.9, Some(99.0), Some(false), 60)
+            .unwrap()
+            .enabled
+    );
+    // Stays enabled while the load persists, offline included; no repeated
+    // write every poll.
+    assert_eq!(poll(&mut policy, 3.9, Some(99.0), Some(false), 3000), None);
+    assert_eq!(poll(&mut policy, 3.9, Some(99.0), Some(false), 3005), None);
+}
+
+#[test]
+fn normal_low_voltage_recovery_while_online_false() {
+    let mut policy = Policy::default();
+    // Light load at 3.7V: the policy first establishes an OFF baseline, then
+    // enables charging 50s after the low voltage is sustained.
+    assert!(
+        !poll(&mut policy, 3.7, Some(10.0), Some(false), 0)
+            .unwrap()
+            .enabled
+    );
+    assert!(
+        poll(&mut policy, 3.7, Some(10.0), Some(false), 50)
+            .unwrap()
+            .enabled
+    );
+    // Recovery holds until the upper limit, with online still false.
+    assert_eq!(poll(&mut policy, 3.9, Some(10.0), Some(false), 100), None);
+    assert_eq!(poll(&mut policy, 3.9, Some(10.0), Some(false), 3000), None);
+}
+
+#[test]
+fn missing_online_does_not_block_policy() {
+    let mut policy = Policy::default();
+    // A read failure (`None`) is not treated as offline and does not block
+    // the emergency command.
+    let controller = super::Controller {
+        battery_voltage: 3.4,
+        cpu_usage: Some(99.0),
+        charger_online: None,
+        ..super::Controller::default()
+    };
+    let d = controller.evaluate_policy(&mut policy, at(0)).unwrap();
+    assert!(d.enabled);
+    // It is also not treated as online; the next poll repeats until applied.
+    assert_eq!(controller.evaluate_policy(&mut policy, at(5)), Some(d));
+}
+
+#[test]
+fn upper_latch_survives_online_flips() {
+    let mut policy = Policy::default();
+    assert!(
+        !poll(&mut policy, 3.9, Some(99.0), Some(true), 0)
+            .unwrap()
+            .enabled
+    );
+    assert!(
+        poll(&mut policy, 3.9, Some(99.0), Some(true), 60)
+            .unwrap()
+            .enabled
+    );
+    let off = poll(&mut policy, 4.2, Some(99.0), Some(false), 70).unwrap();
+    assert!(!off.enabled);
+    // Upper latch keeps charging off while the voltage stays high, no matter
+    // how the online bit flips.
+    assert_eq!(poll(&mut policy, 4.19, Some(99.0), Some(true), 100), None);
+    assert_eq!(poll(&mut policy, 4.19, Some(99.0), Some(false), 400), None);
+    // The latch must survive an offline->online->offline flip too.
+    assert_eq!(poll(&mut policy, 4.19, Some(99.0), Some(true), 700), None);
+    assert_eq!(poll(&mut policy, 4.19, Some(99.0), Some(false), 1000), None);
+    // Rearm at <= UPPER_REARM_V, online back to false.
+    assert!(
+        poll(&mut policy, 4.1, Some(99.0), Some(false), 1005)
+            .unwrap()
+            .enabled
+    );
+}
+
+#[test]
+fn cooldown_survives_online_changes_after_upper_rearm() {
+    let mut policy = Policy::default();
+    poll(&mut policy, 3.9, Some(99.0), Some(true), 0);
+    poll(&mut policy, 3.9, Some(99.0), Some(true), 60);
+    assert!(
+        !poll(&mut policy, 4.2, Some(99.0), Some(false), 70)
+            .unwrap()
+            .enabled
+    );
+    // Rearm the voltage latch, but retain the five-minute dwell even if
+    // online flips or becomes unavailable.
+    assert_eq!(poll(&mut policy, 4.1, Some(99.0), Some(true), 75), None);
+    assert_eq!(poll(&mut policy, 4.1, Some(99.0), None, 365), None);
+    assert!(
+        poll(&mut policy, 4.1, Some(99.0), Some(false), 370)
+            .unwrap()
+            .enabled
+    );
 }
