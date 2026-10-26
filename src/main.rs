@@ -42,14 +42,22 @@ fn init_logger() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn read_milli_value(path: &str) -> Result<f64, anyhow::Error> {
-    let voltage = fs::read_to_string(path)?;
-    Ok(voltage.trim().parse::<f64>()? * 0.000_001f64)
+fn read_micro_value(path: &str) -> Result<f64, anyhow::Error> {
+    let raw = fs::read_to_string(path)?;
+    let value = raw.trim().parse::<f64>()? * 0.000_001;
+    if !value.is_finite() {
+        return Err(anyhow!("Non-finite reading from {path}"));
+    }
+    Ok(value)
 }
 
 fn read_percentage() -> Result<u8, anyhow::Error> {
     let percentage = fs::read_to_string(BATTERY_CAPACITY)?;
-    Ok(percentage.trim().parse()?)
+    let value = percentage.trim().parse::<u8>()?;
+    if value > 100 {
+        return Err(anyhow!("Invalid battery percentage: {value}"));
+    }
+    Ok(value)
 }
 
 fn read_status(path: &str) -> Result<ChargingStatus, anyhow::Error> {
@@ -112,11 +120,9 @@ impl ChargingStatus {
 struct SleepTime(Duration);
 
 const EMERGENCY_START_V: f64 = 3.5;
-const EMERGENCY_START_P: u8 = 25;
 
 const NORMAL_START_V: f64 = 3.75;
 const NORMAL_STOP_V: f64 = 4.2;
-const NORMAL_STOP_A: f64 = 0.9;
 const CPU_LOAD_LIMIT: f64 = 80.0;
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const TOGGLE_INTERVAL: Duration = Duration::from_secs(300);
@@ -132,7 +138,8 @@ struct Controller {
     cpu_samples: u8,
 
     battery_voltage: f64,
-    battery_percentage: u8,
+    // Informational only: the ageing battery's capacity estimate is unreliable.
+    battery_percentage: Option<u8>,
     battery_status: ChargingStatus,
     charger_status: ChargingStatus,
     charger_current: f64,
@@ -150,11 +157,15 @@ impl Controller {
     }
 
     fn read_battery_status(&mut self) -> Result<(), anyhow::Error> {
-        self.battery_voltage = read_milli_value(BATTERY_VOLTAGE)?;
-        self.battery_percentage = read_percentage()?;
+        let voltage = read_micro_value(BATTERY_VOLTAGE)?;
+        if voltage <= 0.0 || voltage > 5.0 {
+            return Err(anyhow!("Invalid battery voltage: {voltage}V"));
+        }
+        self.battery_voltage = voltage;
+        self.battery_percentage = read_percentage().ok();
         self.battery_status = read_status(BATTERY_STATUS)?;
         self.charger_status = read_status(CHARGER_STATUS)?;
-        self.charger_current = read_milli_value(CHARGER_CURRENT)?;
+        self.charger_current = read_micro_value(CHARGER_CURRENT)?;
         Ok(())
     }
 
@@ -180,7 +191,7 @@ impl Controller {
     }
 
     fn is_emergency(&self) -> bool {
-        (self.battery_voltage < EMERGENCY_START_V || self.battery_percentage < EMERGENCY_START_P)
+        (self.battery_voltage < EMERGENCY_START_V)
             && self.charger_status != ChargingStatus::Charging
     }
 
@@ -189,15 +200,8 @@ impl Controller {
     }
 
     fn is_higher_limit(&self) -> bool {
-        self.battery_voltage > NORMAL_STOP_V
-            && [
-                ChargingStatus::Charging,
-                ChargingStatus::Full,
-                ChargingStatus::NotCharging,
-            ]
-            .contains(&self.battery_status)
-            && self.battery_percentage > EMERGENCY_START_P
-            && self.charger_current < NORMAL_STOP_A
+        // USB input current includes the host workload, not just battery charging.
+        self.battery_voltage >= NORMAL_STOP_V
     }
 
     fn is_high_cpu_load(&self) -> bool {
@@ -209,7 +213,7 @@ impl Controller {
         let to_state = if bit { "ON" } else { "OFF" };
         let now = Utc::now();
         log::info!(
-            "charger {to_state} at {:.3}V, {}A, {}%, cpu={:.1}%, battery_status={:?}, charger_status={:?}",
+            "charger {to_state} at {:.3}V, usb_input={}A, capacity={:?}%, cpu={:.1}%, battery_status={:?}, charger_status={:?}",
             self.battery_voltage,
             self.charger_current,
             self.battery_percentage,
@@ -319,3 +323,6 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
