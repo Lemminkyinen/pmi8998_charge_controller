@@ -10,11 +10,25 @@ Enabling charging does not guarantee USB bypass operation or adequate power unde
 
 ## Measurement and failure handling
 
-Build with `cargo build --release`. First run on the phone without changing charging:
+Build **as your normal user**, not with `sudo`:
+
+```sh
+cargo build --release
+```
+
+First run on the phone without changing charging:
 
 ```sh
 ./target/release/pmi8998_charge_controller --dry-run
 ```
+
+After reviewing measurements and the limitations below, real control uses the already-built binary with elevated privileges:
+
+```sh
+sudo ./target/release/pmi8998_charge_controller
+```
+
+Do not use `sudo cargo run -r`: `sudo` normally selects root's Rust environment, which may have no default toolchain even though your own user can build successfully. An error saying `rustup could not choose a version of cargo` in this situation is a build-environment error, not a controller failure. You do not need to install or configure Rust for root. Only the controller binary needs elevated privileges to write sysfs and its log file. Stopping the controller does not restore a previous charging setting; verify the desired setting afterward.
 
 Dry-run prints readings and simulated decisions every five seconds, never writes sysfs, and does not require root if the readings are accessible. It cannot simulate how the real battery would respond to a charging change. Stop it with Ctrl+C. Real control (without `--dry-run`) requires root and logs to `/var/log/charge-control.log`, with samples every minute and every transition logged. Configure external log rotation (for example, logrotate with `copytruncate`) and your service supervisor's automatic restart policy before unattended use.
 
