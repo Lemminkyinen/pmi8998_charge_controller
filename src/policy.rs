@@ -36,6 +36,20 @@ fn sustained(since: &mut Option<Duration>, active: bool, now: Duration, delay: D
 }
 
 impl Policy {
+    pub fn interrupt_samples(&mut self) {
+        self.low_since = None;
+        self.busy_since = None;
+        self.quiet_since = None;
+        self.heavy_load = false;
+    }
+
+    pub fn force_off(&self, reason: &'static str) -> Option<Decision> {
+        (self.commanded != Some(false)).then_some(Decision {
+            enabled: false,
+            reason,
+        })
+    }
+
     /// Evaluate fresh readings. `now` is monotonic time since process startup.
     pub fn evaluate(&mut self, voltage: f64, cpu: Option<f64>, now: Duration) -> Option<Decision> {
         if let Some(cpu) = cpu {

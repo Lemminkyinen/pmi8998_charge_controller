@@ -87,3 +87,48 @@ fn interrupted_cpu_burst_does_not_count_as_sustained_load() {
     assert_eq!(apply(&mut policy, 3.9, Some(90.0), 359), None);
     assert!(apply(&mut policy, 3.9, Some(90.0), 360).unwrap().enabled);
 }
+
+#[test]
+fn interrupted_readings_restart_debounce_windows() {
+    let mut policy = Policy::default();
+    apply(&mut policy, 3.7, Some(90.0), 0);
+    policy.interrupt_samples();
+    assert_eq!(apply(&mut policy, 3.7, Some(90.0), 300), None);
+    assert_eq!(apply(&mut policy, 3.7, Some(90.0), 349), None);
+    assert!(apply(&mut policy, 3.7, Some(90.0), 350).unwrap().enabled);
+}
+
+#[test]
+fn sensor_failure_stop_bypasses_dwell_and_only_acknowledges_success() {
+    let mut policy = Policy::default();
+    apply(&mut policy, 3.4, None, 0);
+    let stop = policy.force_off("sensors failed").unwrap();
+    assert!(!stop.enabled);
+    assert_eq!(policy.force_off("sensors failed"), Some(stop));
+    policy.applied(stop, at(5));
+    assert_eq!(policy.force_off("sensors failed"), None);
+    // Fresh critically low readings can still recover immediately.
+    assert!(apply(&mut policy, 3.4, None, 10).unwrap().enabled);
+}
+
+#[test]
+fn quiet_load_does_not_interrupt_low_voltage_recovery() {
+    let mut policy = Policy::default();
+    apply(&mut policy, 3.4, Some(90.0), 0);
+    apply(&mut policy, 3.9, Some(10.0), 300);
+    assert_eq!(apply(&mut policy, 3.9, Some(10.0), 420), None);
+    assert!(
+        !apply(&mut policy, NORMAL_STOP_V, Some(10.0), 425)
+            .unwrap()
+            .enabled
+    );
+}
+
+#[test]
+fn middle_cpu_band_holds_heavy_mode_without_chatter() {
+    let mut policy = Policy::default();
+    policy.evaluate(3.9, Some(90.0), at(0));
+    apply(&mut policy, 3.9, Some(90.0), 60);
+    assert_eq!(apply(&mut policy, 3.9, Some(70.0), 360), None);
+    assert_eq!(apply(&mut policy, 3.9, Some(70.0), 600), None);
+}

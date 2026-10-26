@@ -2,6 +2,7 @@ use anyhow::anyhow;
 use chrono::Utc;
 use log::LevelFilter;
 use log4rs::Config;
+use log4rs::append::console::ConsoleAppender;
 use log4rs::append::file::FileAppender;
 use log4rs::config::{Appender, Root};
 use log4rs::encode::pattern::PatternEncoder;
@@ -21,20 +22,25 @@ const LOG_FILE: &str = "/var/log/charge-control.log";
 const BATTERY_VOLTAGE: &str = "/sys/class/power_supply/bq27411-0/voltage_now";
 const BATTERY_CAPACITY: &str = "/sys/class/power_supply/bq27411-0/capacity";
 const BATTERY_STATUS: &str = "/sys/class/power_supply/bq27411-0/status";
-const _CHARGER_VOLTAGE: &str = "/sys/class/power_supply/pmi8998-charger/voltage_now";
+const BATTERY_CURRENT: &str = "/sys/class/power_supply/bq27411-0/current_now";
+const BATTERY_TEMPERATURE: &str = "/sys/class/power_supply/bq27411-0/temp";
+const CHARGER_ONLINE: &str = "/sys/class/power_supply/pmi8998-charger/online";
 const CHARGER_STATUS: &str = "/sys/class/power_supply/pmi8998-charger/status";
 const CHARGER_CURRENT: &str = "/sys/class/power_supply/pmi8998-charger/current_now";
 const CPU_STAT: &str = "/proc/stat";
 
-fn init_logger() -> anyhow::Result<()> {
-    let logfile = FileAppender::builder()
-        .encoder(Box::new(PatternEncoder::new(
-            "{d(%Y-%m-%d %H:%M:%S%.3f)(utc)} [{l}] {m}{n}",
-        )))
-        .build(LOG_FILE)?;
+fn init_logger(dry_run: bool) -> anyhow::Result<()> {
+    let encoder = Box::new(PatternEncoder::new(
+        "{d(%Y-%m-%d %H:%M:%S%.3f)(utc)} [{l}] {m}{n}",
+    ));
+    let appender: Box<dyn log4rs::append::Append> = if dry_run {
+        Box::new(ConsoleAppender::builder().encoder(encoder).build())
+    } else {
+        Box::new(FileAppender::builder().encoder(encoder).build(LOG_FILE)?)
+    };
 
     let config = Config::builder()
-        .appender(Appender::builder().build("logfile", Box::new(logfile)))
+        .appender(Appender::builder().build("logfile", appender))
         .build(
             Root::builder()
                 .appender("logfile")
@@ -66,6 +72,24 @@ fn read_percentage() -> Result<u8, anyhow::Error> {
 fn read_status(path: &str) -> Result<ChargingStatus, anyhow::Error> {
     let status = fs::read_to_string(path)?;
     Ok(ChargingStatus::from_str(&status))
+}
+
+fn read_online() -> anyhow::Result<bool> {
+    let raw = fs::read_to_string(CHARGER_ONLINE)?;
+    match raw.trim() {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        value => Err(anyhow!("Invalid charger online value: {value}")),
+    }
+}
+
+fn read_temperature() -> anyhow::Result<f64> {
+    let raw = fs::read_to_string(BATTERY_TEMPERATURE)?;
+    let temperature = raw.trim().parse::<f64>()? / 10.0;
+    if !temperature.is_finite() || !(-50.0..=100.0).contains(&temperature) {
+        return Err(anyhow!("Invalid battery temperature: {temperature}"));
+    }
+    Ok(temperature)
 }
 
 /// Reads aggregate CPU times from /proc/stat and returns (idle, total) jiffies.
@@ -129,7 +153,10 @@ struct Controller {
     battery_percentage: Option<u8>,
     battery_status: ChargingStatus,
     charger_status: ChargingStatus,
-    charger_current: f64,
+    charger_current: Option<f64>,
+    battery_current: Option<f64>,
+    battery_temperature: Option<f64>,
+    charger_online: bool,
 
     cpu_usage: Option<f64>,
     prev_idle: Option<u64>,
@@ -143,10 +170,13 @@ impl Controller {
             return Err(anyhow!("Invalid battery voltage: {voltage}V"));
         }
         self.battery_voltage = voltage;
+        self.charger_online = read_online()?;
         self.battery_percentage = read_percentage().ok();
-        self.battery_status = read_status(BATTERY_STATUS)?;
-        self.charger_status = read_status(CHARGER_STATUS)?;
-        self.charger_current = read_micro_value(CHARGER_CURRENT)?;
+        self.battery_status = read_status(BATTERY_STATUS).unwrap_or_default();
+        self.charger_status = read_status(CHARGER_STATUS).unwrap_or_default();
+        self.charger_current = read_micro_value(CHARGER_CURRENT).ok();
+        self.battery_current = read_micro_value(BATTERY_CURRENT).ok();
+        self.battery_temperature = read_temperature().ok();
         Ok(())
     }
 
@@ -159,7 +189,7 @@ impl Controller {
                 let idle_delta = idle.saturating_sub(prev_idle) as f64;
                 let total_delta = total.saturating_sub(prev_total) as f64;
                 if total_delta > 0.0 {
-                    Some((1.0 - idle_delta / total_delta) * 100.0)
+                    Some(((1.0 - idle_delta / total_delta) * 100.0).clamp(0.0, 100.0))
                 } else {
                     None
                 }
@@ -171,13 +201,15 @@ impl Controller {
         Ok(())
     }
 
-    fn apply(&self, decision: Decision) -> Result<(), anyhow::Error> {
+    fn apply(&self, decision: Decision, dry_run: bool) -> Result<(), anyhow::Error> {
         let to_state = if decision.enabled { "ON" } else { "OFF" };
         let now = Utc::now();
-        set_charging_bit(decision.enabled)
-            .map_err(|e| anyhow!("Failed to set charger {to_state} {e}! {now}"))?;
+        if !dry_run {
+            set_charging_bit(decision.enabled)
+                .map_err(|e| anyhow!("Failed to set charger {to_state} {e}! {now}"))?;
+        }
         log::info!(
-            "charger {to_state}: {} at {:.3}V, usb_input={}A, capacity={:?}%, cpu={:.1}%, battery_status={:?}, charger_status={:?}",
+            "dry_run={dry_run} charger {to_state}: {} at {:.3}V, usb_input={:?}A, capacity={:?}%, cpu={:.1}%, battery_status={:?}, charger_status={:?}",
             decision.reason,
             self.battery_voltage,
             self.charger_current,
@@ -188,43 +220,111 @@ impl Controller {
         );
         Ok(())
     }
+
+    fn log_sample(&self) {
+        log::info!(
+            "sample voltage={:.3}V, battery_current={:?}A, temperature={:?}C, usb_input={:?}A, capacity={:?}%, cpu={:?}%, online={}, battery_status={:?}, charger_status={:?}",
+            self.battery_voltage,
+            self.battery_current,
+            self.battery_temperature,
+            self.charger_current,
+            self.battery_percentage,
+            self.cpu_usage,
+            self.charger_online,
+            self.battery_status,
+            self.charger_status,
+        );
+    }
 }
 
 fn main() -> ExitCode {
-    if let Err(e) = init_logger() {
+    let mut dry_run = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--dry-run" => dry_run = true,
+            "--help" | "-h" => {
+                println!(
+                    "Usage: pmi8998_charge_controller [--dry-run]\n\n--dry-run  Log readings and proposed actions to the terminal; never write sysfs."
+                );
+                return ExitCode::SUCCESS;
+            }
+            _ => {
+                eprintln!("Unknown argument: {arg}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    if let Err(e) = init_logger(dry_run) {
         eprintln!("Failed to initialize logger: {e}");
         return ExitCode::FAILURE;
     }
 
     // Check for root access
-    if !Uid::effective().is_root() {
+    if !dry_run && !Uid::effective().is_root() {
         log::error!("Root access required for writing {}", CHARGER_STATUS);
         return ExitCode::FAILURE;
     }
 
-    log::info!("Starting charge controller!");
+    log::info!("Starting charge controller: dry_run={dry_run}");
+    log::warn!(
+        "Voltage thresholds are not calibrated for this battery. Software temperature inhibition is not configured; retain hardware thermal protections."
+    );
     let mut controller = Controller::default();
     let mut policy = Policy::default();
     let started = Instant::now();
+    let mut failed_samples = 0u32;
+    let mut next_sample_log = Duration::ZERO;
+    let mut was_online = None;
 
     loop {
-        if let Err(e) = controller
-            .read_battery_status()
-            .and_then(|_| controller.read_cpu_usage())
-        {
-            log::error!("Failed to read battery/cpu status: {e}");
-            return ExitCode::FAILURE;
-        }
-
         let now = started.elapsed();
-        if let Some(decision) =
-            policy.evaluate(controller.battery_voltage, controller.cpu_usage, now)
-        {
-            if let Err(err) = controller.apply(decision) {
-                log::error!("{err}");
-                return ExitCode::FAILURE;
+        let decision = if let Err(e) = controller.read_battery_status() {
+            failed_samples = failed_samples.saturating_add(1);
+            policy.interrupt_samples();
+            controller.cpu_usage = None;
+            controller.prev_idle = None;
+            controller.prev_total = None;
+            log::error!("Critical sample failed ({failed_samples}): {e}");
+            // Do not charge indefinitely using stale readings. This trades
+            // availability for battery protection when critical sensors fail.
+            if failed_samples >= 3 {
+                policy.force_off("critical sensors unavailable; readings are stale")
+            } else {
+                None
             }
-            policy.applied(decision, now);
+        } else {
+            if failed_samples > 0 {
+                log::info!("Critical sensors recovered");
+                failed_samples = 0;
+            }
+            if let Err(e) = controller.read_cpu_usage() {
+                log::warn!("CPU reading unavailable: {e}");
+                controller.cpu_usage = None;
+                controller.prev_idle = None;
+                controller.prev_total = None;
+            }
+            if dry_run || now >= next_sample_log {
+                controller.log_sample();
+                next_sample_log = now + Duration::from_secs(60);
+            }
+            if was_online != Some(controller.charger_online) {
+                log::info!("Charger online={}", controller.charger_online);
+                policy = Policy::default();
+                was_online = Some(controller.charger_online);
+            }
+            if controller.charger_online {
+                policy.evaluate(controller.battery_voltage, controller.cpu_usage, now)
+            } else {
+                // Re-evaluate from fresh state on reconnect; no repeated writes
+                // to an absent power source.
+                None
+            }
+        };
+        if let Some(decision) = decision {
+            match controller.apply(decision, dry_run) {
+                Ok(()) => policy.applied(decision, now),
+                Err(err) => log::error!("{err}; retrying on the next sample"),
+            }
         }
         thread::sleep(POLL_INTERVAL);
     }
