@@ -22,6 +22,37 @@ Voltage and USB `online` are required. Temporary failures are retried every five
 
 Temperature is currently **telemetry only**, not a software charging interlock. Hardware thermal protections must remain enabled. Battery-current direction must be verified on the phone before interpreting its sign. Gather idle/load measurements with charging both enabled and disabled before tuning voltages or adding battery-specific thermal limits. No controller can prevent swelling of a failing battery; stop using a swollen or overheating battery.
 
+### Supervised measurement sequence
+
+Capture a short baseline on the actual phone:
+
+```sh
+./target/release/pmi8998_charge_controller --dry-run | tee charge-measurements.log
+```
+
+Record when the real charging setting or workload changes; dry-run decisions do not make those changes. A dry-run observer may run alongside the existing controller, but changing its real setting for an experiment requires first stopping any service that would overwrite that setting. Do not run two write-enabled controllers. Keep a way to restore charging and observe the phone locally if USB also provides its network connection.
+
+Measure these phases under supervision, allowing a few minutes for each idle baseline and only a short representative workload initially:
+
+| Real charging setting | Workload | What to learn |
+| --- | --- | --- |
+| Enabled | Idle | Baseline voltage, temperature, battery and USB input current |
+| Disabled | Idle | Whether the battery actually discharges while USB remains connected; voltage rebound/sag after switching |
+| Disabled | Representative Docker load | Voltage sag and discharge rate under the actual host workload |
+| Enabled | Same Docker load | Whether charging helps voltage/current recover without excessive heating |
+| Disabled | Idle again | Whether the voltage recovers when the load ends |
+
+Restore the original charging setting afterward. Do not deliberately discharge to the emergency threshold, start an unbounded stress test, or leave the experiment unattended. Stop on abnormal heating, rapidly collapsing voltage, or instability. Do not experiment with a swollen battery.
+
+Interpret short traces cautiously:
+
+- A proposed OFF action does not contradict a subsequent `Charging` status in dry-run: no write occurred.
+- Battery and charger status are different readings, sampled sequentially; they can disagree or change between samples. Neither is an enable-bit readback.
+- A zero USB input current reading does not prove USB supplies no power. For example, the upstream 6.16 charger driver reports zero through its measurement helper when charger status is not `Charging`. Verify downstream behavior before interpreting it.
+- Percentage is informational only. A battery-current sign or a single loaded voltage does not establish remaining capacity.
+
+Use these traces to choose operating voltages and battery-specific thermal limits; the defaults are not a calibration. Remove device identifiers and other private data before sharing logs.
+
 Developed and tested on a OnePlus 6 `Linux enchilada 6.16.7-sdm845 #4-postmarketos-qcom-sdm845 SMP aarch64`. My phone's battery is degraded, so what works for my enchilada, might not work for yours.
 
 ### Disclaimer
