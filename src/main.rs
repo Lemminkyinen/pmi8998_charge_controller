@@ -13,7 +13,10 @@ use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 mod policy;
+mod telemetry;
+
 use policy::{Decision, Policy};
+use telemetry::{format_amps, format_celsius, format_cpu_percent, format_percent, format_volts};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -207,29 +210,42 @@ impl Controller {
         if !dry_run {
             set_charging_bit(decision.enabled)
                 .map_err(|e| anyhow!("Failed to set charger {to_state} {e}! {now}"))?;
+            log::info!(
+                "charger {to_state} (applied): {} at {}V, usb_input={}A, capacity={}%, cpu={}%, battery_status={:?}, charger_status={:?}",
+                decision.reason,
+                format_volts(Some(self.battery_voltage)),
+                format_amps(self.charger_current),
+                format_percent(self.battery_percentage),
+                format_cpu_percent(self.cpu_usage),
+                self.battery_status,
+                self.charger_status,
+            );
+        } else {
+            // Never claim the charger changed state in dry-run mode: the
+            // decision is proposed and simulated, not written to sysfs.
+            log::info!(
+                "dry-run: charger would be set {to_state} (simulated, no hardware write): {} at {}V, usb_input={}A, capacity={}%, cpu={}%, battery_status={:?}, charger_status={:?}",
+                decision.reason,
+                format_volts(Some(self.battery_voltage)),
+                format_amps(self.charger_current),
+                format_percent(self.battery_percentage),
+                format_cpu_percent(self.cpu_usage),
+                self.battery_status,
+                self.charger_status,
+            );
         }
-        log::info!(
-            "dry_run={dry_run} charger {to_state}: {} at {:.3}V, usb_input={:?}A, capacity={:?}%, cpu={:.1}%, battery_status={:?}, charger_status={:?}",
-            decision.reason,
-            self.battery_voltage,
-            self.charger_current,
-            self.battery_percentage,
-            self.cpu_usage.unwrap_or(-1.0),
-            self.battery_status,
-            self.charger_status,
-        );
         Ok(())
     }
 
     fn log_sample(&self) {
         log::info!(
-            "sample voltage={:.3}V, battery_current={:?}A, temperature={:?}C, usb_input={:?}A, capacity={:?}%, cpu={:?}%, online={}, battery_status={:?}, charger_status={:?}",
-            self.battery_voltage,
-            self.battery_current,
-            self.battery_temperature,
-            self.charger_current,
-            self.battery_percentage,
-            self.cpu_usage,
+            "sample voltage={}V, battery_current={}A, temperature={}C, usb_input={}A, capacity={}%, cpu={}%, online={}, battery_status={:?}, charger_status={:?}",
+            format_volts(Some(self.battery_voltage)),
+            format_amps(self.battery_current),
+            format_celsius(self.battery_temperature),
+            format_amps(self.charger_current),
+            format_percent(self.battery_percentage),
+            format_cpu_percent(self.cpu_usage),
             self.charger_online,
             self.battery_status,
             self.charger_status,
