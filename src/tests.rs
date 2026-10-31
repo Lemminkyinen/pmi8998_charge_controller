@@ -259,7 +259,9 @@ fn upper_latch_survives_online_flips() {
 }
 
 #[test]
-fn cooldown_survives_online_changes_after_upper_rearm() {
+fn upper_rearm_resumes_load_without_off_cooldown() {
+    // Latched high voltage remains OFF; once <=4.1V with established high load,
+    // re-enable immediately (no 5-min dwell). Online changes must not affect it.
     let mut policy = Policy::default();
     poll(&mut policy, 3.9, Some(99.0), Some(true), 0);
     poll(&mut policy, 3.9, Some(99.0), Some(true), 60);
@@ -268,13 +270,122 @@ fn cooldown_survives_online_changes_after_upper_rearm() {
             .unwrap()
             .enabled
     );
-    // Rearm the voltage latch, but retain the five-minute dwell even if
-    // online flips or becomes unavailable.
-    assert_eq!(poll(&mut policy, 4.1, Some(99.0), Some(true), 75), None);
+    // Still within latch at 4.19V -> no decision
+    assert_eq!(poll(&mut policy, 4.19, Some(99.0), Some(true), 74), None);
+    // Rearm at 4.1V with established heavy load -> immediate ON (no dwell)
+    let on = poll(&mut policy, 4.1, Some(99.0), Some(true), 75).unwrap();
+    assert!(on.enabled);
+    assert_eq!(on.reason, "sustained CPU load");
+    // Online changes don't affect the decision (stays ON, no repeated writes)
     assert_eq!(poll(&mut policy, 4.1, Some(99.0), None, 365), None);
+    assert_eq!(poll(&mut policy, 4.1, Some(99.0), Some(false), 370), None);
+}
+
+#[test]
+fn repeated_workload_intervals_enable_without_off_cooldown() {
+    // After workload ON then quiet OFF, another sustained busy interval
+    // enables at 60s even inside 300s since OFF.
+    let mut policy = Policy::default();
+    // First workload interval -> ON at 60s
+    apply(&mut policy, 3.9, Some(90.0), 0);
+    assert!(apply(&mut policy, 3.9, Some(90.0), 60).unwrap().enabled);
+    // Quiet down: heavy_load clears after 120s of <=60% CPU
+    apply(&mut policy, 3.9, Some(10.0), 70);
+    apply(&mut policy, 3.9, Some(10.0), 180); // quiet_since=70, 180-70=110 < 120
+    apply(&mut policy, 3.9, Some(10.0), 190); // quiet_since=70, 190-70=120 >= 120 -> heavy_load=false
+    // Still ON (within MIN_ON_TIME of 300s since t=60)
+    assert_eq!(apply(&mut policy, 3.9, Some(10.0), 300), None);
+    assert_eq!(apply(&mut policy, 3.9, Some(10.0), 359), None);
+    // OFF after MIN_ON_TIME
+    assert!(!apply(&mut policy, 3.9, Some(10.0), 360).unwrap().enabled);
+    // Second workload interval starts at 400s (40s after OFF)
+    // Should enable at 460s (60s into new interval), not 660s (300s after OFF)
+    apply(&mut policy, 3.9, Some(90.0), 400);
+    assert_eq!(apply(&mut policy, 3.9, Some(90.0), 459), None);
+    let on = apply(&mut policy, 3.9, Some(90.0), 460).unwrap();
+    assert!(on.enabled);
+    assert_eq!(on.reason, "sustained CPU load");
+}
+
+#[test]
+fn low_voltage_recovery_after_upper_off_starts_at_50s_not_300s() {
+    // After upper-limit OFF, sustained 3.7V starts recovery at 50s, not 300s.
+    let mut policy = Policy::default();
+    apply(&mut policy, 3.9, Some(90.0), 0);
+    assert!(apply(&mut policy, 3.9, Some(90.0), 60).unwrap().enabled);
+    assert!(!apply(&mut policy, NORMAL_STOP_V, None, 70).unwrap().enabled);
+    apply(&mut policy, 4.1, None, 80);
+    apply(&mut policy, 3.7, None, 80);
+    assert_eq!(apply(&mut policy, 3.7, None, 129), None);
+    let on = apply(&mut policy, 3.7, None, 130).unwrap();
+    assert!(on.enabled);
+    assert_eq!(on.reason, "low-voltage recovery");
+}
+
+#[test]
+fn recovery_resumes_promptly_after_force_off_not_300s() {
+    // After force_off for stale sensors during recovery, fresh 3.8V resumes
+    // recovery promptly, not 300s. Fresh >3.5V prevents masking by emergency
+    // bypass.
+    let mut policy = Policy::default();
+    apply(&mut policy, 3.7, None, 0);
+    assert!(apply(&mut policy, 3.7, None, 50).unwrap().enabled);
+    policy.interrupt_samples();
+    let stop = policy.force_off("sensors failed").unwrap();
+    assert!(!stop.enabled);
+    policy.applied(stop, at(100));
+    // Fresh 3.8V reading (above emergency, above normal start) resumes recovery
+    let on = apply(&mut policy, 3.8, None, 110).unwrap();
+    assert!(on.enabled);
+    assert_eq!(on.reason, "low-voltage recovery");
+}
+
+#[test]
+fn light_load_off_respects_min_on_time_but_upper_bypasses() {
+    // Ordinary light-load OFF still respects minimum ON time, but
+    // upper-voltage stop can bypass it.
+    let mut policy = Policy::default();
+    // Establish heavy load -> ON at 60s
+    apply(&mut policy, 3.9, Some(90.0), 0);
+    assert!(apply(&mut policy, 3.9, Some(90.0), 60).unwrap().enabled);
+    // Quiet down immediately -> still ON (within MIN_ON_TIME)
+    assert_eq!(apply(&mut policy, 3.9, Some(10.0), 100), None);
+    assert_eq!(apply(&mut policy, 3.9, Some(10.0), 359), None);
+    // After 300s ON time -> OFF for light load
+    assert!(!apply(&mut policy, 3.9, Some(10.0), 360).unwrap().enabled);
+    // Reset: new ON via heavy load
+    apply(&mut policy, 3.9, Some(90.0), 400);
+    assert!(apply(&mut policy, 3.9, Some(90.0), 460).unwrap().enabled);
+    // Upper voltage -> OFF immediately (bypasses MIN_ON_TIME)
     assert!(
-        poll(&mut policy, 4.1, Some(99.0), Some(false), 370)
+        !apply(&mut policy, NORMAL_STOP_V, Some(90.0), 470)
             .unwrap()
             .enabled
     );
+}
+
+#[test]
+fn failed_on_write_retry_produced_next_poll_if_not_applied() {
+    // Failed ON write retry inside recent OFF interval still produces next
+    // poll if not applied.
+    let mut policy = Policy::default();
+    // Start recovery ON at emergency voltage
+    let on = policy.evaluate(3.4, None, at(0)).unwrap();
+    assert!(on.enabled);
+    policy.applied(on, at(0));
+    // Upper-voltage OFF
+    let off = policy.evaluate(4.2, None, at(5)).unwrap();
+    assert!(!off.enabled);
+    policy.applied(off, at(5));
+    // Low voltage starts at t10, qualifies at t60 (50s delay)
+    policy.evaluate(3.7, None, at(10));
+    let on2 = policy.evaluate(3.7, None, at(60)).unwrap();
+    assert!(on2.enabled);
+    assert_eq!(on2.reason, "low-voltage recovery");
+    // Don't acknowledge -> retry on next poll
+    assert_eq!(policy.evaluate(3.7, None, at(65)), Some(on2));
+    // Acknowledge
+    policy.applied(on2, at(65));
+    // Now no more retries
+    assert_eq!(policy.evaluate(3.7, None, at(70)), None);
 }

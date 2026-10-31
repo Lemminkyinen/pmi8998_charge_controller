@@ -7,7 +7,7 @@ const UPPER_REARM_V: f64 = 4.1;
 const LOW_DELAY: Duration = Duration::from_secs(50);
 const LOAD_ENTER_DELAY: Duration = Duration::from_secs(60);
 const LOAD_EXIT_DELAY: Duration = Duration::from_secs(120);
-const MIN_DWELL: Duration = Duration::from_secs(300);
+const MIN_ON_TIME: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Decision {
@@ -24,7 +24,7 @@ pub struct Policy {
     recovering: bool,
     upper_latched: bool,
     commanded: Option<bool>,
-    last_transition: Option<Duration>,
+    on_since: Option<Duration>,
 }
 
 fn sustained(since: &mut Option<Duration>, active: bool, now: Duration, delay: Duration) -> bool {
@@ -115,12 +115,15 @@ impl Policy {
         if self.commanded == Some(decision.enabled) {
             return None;
         }
-        // Keep sampling during the dwell period. Voltage limits bypass it.
-        if !emergency
+        // Ordinary light-load OFF must wait until the charger has been ON for
+        // MIN_ON_TIME. Every ON decision bypasses this timer (still obeys
+        // voltage hysteresis and low/load debounce). Upper-voltage OFF and
+        // force_off are immediate.
+        if !decision.enabled
             && !self.upper_latched
             && self
-                .last_transition
-                .is_some_and(|last| now.saturating_sub(last) < MIN_DWELL)
+                .on_since
+                .is_some_and(|on| now.saturating_sub(on) < MIN_ON_TIME)
         {
             return None;
         }
@@ -129,10 +132,10 @@ impl Policy {
 
     /// Only acknowledge writes that actually succeeded.
     pub fn applied(&mut self, decision: Decision, now: Duration) {
-        // Establishing an OFF baseline at startup must not delay the first
-        // low-voltage or sustained-load request by five minutes.
-        if self.commanded.is_some() || decision.enabled {
-            self.last_transition = Some(now);
+        if decision.enabled {
+            self.on_since = Some(now);
+        } else {
+            self.on_since = None;
         }
         self.commanded = Some(decision.enabled);
     }
